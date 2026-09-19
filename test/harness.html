@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>B站 按住方向键倍速微调 —— 离线测试台</title>
+<style>
+  body { margin: 0; font: 14px/1.6 -apple-system, "Microsoft YaHei", sans-serif; background: #14161a; color: #e8eaed; }
+  #wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #9aa0a6; font-size: 12px; margin-bottom: 16px; }
+  #player { position: relative; width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 8px; overflow: hidden; }
+  .bpx-player-video-wrap { position: relative; width: 100%; height: 100%; }
+  #player video { width: 100%; height: 100%; display: block; object-fit: contain; }
+  #panel { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+  button { background: #2a2e35; color: #e8eaed; border: 1px solid #3c4149; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #363b44; }
+  pre { background: #0f1115; border: 1px solid #2a2e35; border-radius: 8px; padding: 12px; overflow: auto; max-height: 340px; font-size: 12px; }
+  .pass { color: #7ee787; }
+  .fail { color: #ff7b72; }
+  #hud { display: flex; gap: 18px; font-size: 13px; color: #9aa0a6; margin: 8px 0; }
+  #hud b { color: #e8eaed; font-weight: 600; }
+  ol { color: #9aa0a6; font-size: 12px; padding-left: 20px; }
+  ol b { color: #e8eaed; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>B站 按住方向键倍速微调 —— 离线测试台</h1>
+  <div class="sub">
+    本页面模拟 B 站播放器结构（<code>.bpx-player-container &gt; .bpx-player-video-wrap &gt; video</code>），
+    并在页面里复刻了 B 站原生的键盘行为，用来在离线环境回归脚本。脚本源码直接读自
+    <code>../bilibili-hold-speed.user.js</code>。
+    <br>
+    <b>注意：脚本只在检测到播放器容器时才会介入</b>（用于避免干扰 B 站首页等页面），
+    因此这里的 DOM 结构必须与 B 站保持一致。
+  </div>
+
+  <!-- 结构与 B 站播放器保持一致：脚本靠 .bpx-player-container / .bpx-player-video-wrap 判断这是播放器 -->
+  <div class="bpx-player-container" id="player">
+    <div class="bpx-player-video-wrap">
+      <video src="" muted playsinline loop></video>
+    </div>
+  </div>
+
+  <div id="hud">
+    <span>播放倍速：<b id="hudRate">1</b></span>
+    <span>音量：<b id="hudVol">1</b></span>
+    <span>脚本状态：<b id="hudMode">未激活</b></span>
+    <span>记住的倍速：<b id="hudLast">无</b></span>
+  </div>
+
+  <div id="panel">
+    <button id="run">运行全部测试</button>
+    <button id="clear">清空结果</button>
+  </div>
+
+  <ol>
+    <li>先点一下视频区域，让页面获得键盘焦点。</li>
+    <li>手动体验：<b>按住 →</b> 进入 3 倍速，不松手时按 <b>↑ / ↓</b> 以 0.25 步长调节，<b>松开 →</b> 回到 1 倍速。</li>
+    <li>也可以直接点「运行全部测试」自动跑一遍（包含合成按键与断言）。</li>
+  </ol>
+
+  <pre id="out">点「运行全部测试」开始。</pre>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// 1) 复刻 B 站播放器的原生键盘行为，用于验证脚本的接管是否正确
+//    - 按住 → ≥300ms：把 playbackRate / defaultPlaybackRate 设为 3
+//    - 短按 →：快进 5 秒
+//    - ↑ / ↓：音量 ±10%
+// ---------------------------------------------------------------------------
+(function nativePlayerSim() {
+  const video = document.querySelector("#player video");
+  const keydownMap = new Map();
+  const LONG_PRESS = 300;
+  const HOLD_RATE = 3;
+
+  window.__NATIVE_LOG__ = [];
+  const log = (m) => window.__NATIVE_LOG__.push(m);
+
+  // 与 B 站一致：输入框/可编辑元素获得焦点时，播放器不做任何快捷键处理
+  function isEditable(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    return el.isContentEditable === true;
+  }
+  function hasEditableFocus(target) {
+    return isEditable(target) || isEditable(document.activeElement);
+  }
+
+  function setRate(r) {
+    video.playbackRate = r;
+    video.defaultPlaybackRate = r;
+  }
+
+  function tuneVolume(delta) {
+    video.volume = Math.min(1, Math.max(0, Math.round((video.volume + delta) * 100) / 100));
+  }
+
+  window.addEventListener("keydown", function (e) {
+    const kc = e.keyCode || e.which;
+    if (!kc) return;
+    if (hasEditableFocus(e.target)) return;
+    if (keydownMap.get(kc)) return;
+    const entry = { done: false, timer: 0 };
+    keydownMap.set(kc, entry);
+
+    if (kc === 39 || kc === 102) {
+      e.preventDefault();
+      entry.timer = window.setTimeout(function () {
+        entry.done = true;
+        if (video.paused) video.play().catch(function () {});
+        setRate(HOLD_RATE);
+        log("原生：长按 → 进入 " + HOLD_RATE + "x");
+      }, LONG_PRESS);
+      return;
+    }
+    if (kc === 38 || kc === 104) {
+      tuneVolume(0.1);
+      log("原生：↑ 音量 +10%");
+      return;
+    }
+    if (kc === 40 || kc === 98) {
+      tuneVolume(-0.1);
+      log("原生：↓ 音量 -10%");
+      return;
+    }
+  });
+
+  window.addEventListener("keyup", function (e) {
+    const kc = e.keyCode || e.which;
+    const entry = keydownMap.get(kc);
+    if (!entry) return;
+    keydownMap.delete(kc);
+    if (kc !== 39 && kc !== 102) return;
+    if (entry.timer) window.clearTimeout(entry.timer);
+    if (entry.done) {
+      setRate(1);
+      log("原生：松开 → 恢复 1x");
+    } else {
+      video.currentTime = Math.min(video.currentTime + 5, (video.duration || Infinity) - 0.1);
+      if (video.paused) video.play().catch(function () {});
+      log("原生：短按 → 快进 5s");
+    }
+  });
+
+  // 视频源：用一个极短的静音视频循环播放，保证 playbackRate 可写、currentTime 可跳
+  const buf = new Uint8Array([
+    0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88, 0x6d, 0x61, 0x74, 0x72, 0x6f, 0x73, 0x6b, 0x61,
+  ]);
+  video.src = URL.createObjectURL(new Blob([buf], { type: "video/webm" }));
+})();
+
+// ---------------------------------------------------------------------------
+// 2) 加载被测脚本（真实源码），并在没有 GM_* API 时走 localStorage 降级
+// ---------------------------------------------------------------------------
+window.__BHS_TEST_SRC__ = null;
+</script>
+
+<script id="loader">
+// 通过 fetch 读取脚本源码后注入（需要以 http(s) 打开本页面；直接双击 file:// 打开时浏览器会拒绝 fetch）
+fetch("../bilibili-hold-speed.user.js")
+  .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); })
+  .then(function (src) {
+    window.__BHS_TEST_SRC__ = src;
+    const tag = document.createElement("script");
+    tag.textContent = src;
+    document.body.appendChild(tag);
+    document.getElementById("out").textContent =
+      "脚本已加载（" + src.length + " 字节）。\n" +
+      (window.__BHS__ ? "检测到脚本 API：可以开始测试。\n" : "警告：脚本未暴露 API。\n");
+    startHud();
+  })
+  .catch(function (e) {
+    document.getElementById("out").textContent =
+      "无法加载脚本源码：" + e.message + "\n\n" +
+      "请用本地 HTTP 服务打开本页面，例如在项目目录执行：\n" +
+      "  npx serve .      或      python -m http.server 8080\n" +
+      "然后访问 http://localhost:8080/test/harness.html";
+  });
+
+function startHud() {
+  const v = document.querySelector("#player video");
+  setInterval(function () {
+    document.getElementById("hudRate").textContent = v.playbackRate;
+    document.getElementById("hudVol").textContent = Math.round(v.volume * 100) / 100;
+    document.getElementById("hudMode").textContent =
+      window.__BHS__ && window.__BHS__.state.mode ? "按住倍速中" : "未激活";
+    document.getElementById("hudLast").textContent =
+      window.__BHS__ && window.__BHS__.cfg.last != null ? window.__BHS__.cfg.last + "x" : "无";
+  }, 120);
+}
+</script>
+
+<script>
+// ---------------------------------------------------------------------------
+// 3) 断言测试
+// ---------------------------------------------------------------------------
+(function tests() {
+  const out = document.getElementById("out");
+  const video = document.querySelector("#player video");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const results = [];
+
+  function ok(name, cond, detail) {
+    results.push({ name: name, pass: !!cond, detail: detail });
+  }
+
+  function fire(type, kc, key, code, opts) {
+    const e = new KeyboardEvent(type, Object.assign({
+      bubbles: true, cancelable: true, key: key, code: code, view: window,
+    }, opts || {}));
+    Object.defineProperty(e, "keyCode", { get: () => kc });
+    Object.defineProperty(e, "which", { get: () => kc });
+    document.body.dispatchEvent(e);
+    return e;
+  }
+  const down = (kc, key, code) => fire("keydown", kc, key, code);
+  const up = (kc, key, code) => fire("keyup", kc, key, code);
+  const press = (kc, key, code) => { const e = down(kc, key, code); up(kc, key, code); return e; };
+
+  async function run() {
+    if (!window.__BHS__) { out.textContent = "脚本未加载，无法测试。"; return; }
+    results.length = 0;
+    window.__NATIVE_LOG__.length = 0;
+    // 干净状态
+    window.__BHS__.cfg.last = null;
+    window.__BHS__.cfg.remember = true;
+    window.__BHS__.cfg.step = 0.25;
+    window.__BHS__.cfg.max = 3;
+    window.__BHS__.cfg.min = 0.5;
+    window.__BHS__.cfg.startRate = 3;
+    window.__BHS__.cfg.restoreTo = "one";
+    window.__BHS__.cfg.bothSides = true;
+    video.volume = 1;
+    window.__BHS__.state.held.clear();
+    if (window.__BHS__.state.mode) window.__BHS__.exitMode();
+    video.playbackRate = 1;
+    video.defaultPlaybackRate = 1;
+
+    const S = window.__BHS__.state;
+
+    // 1. 按住 → 进入起始倍速
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    ok("按住 → 进入 3.0x", video.playbackRate === 3 && S.mode === true, { rate: video.playbackRate, mode: S.mode });
+
+    // 2. ↓ 减一档
+    press(40, "ArrowDown", "ArrowDown");
+    await sleep(80);
+    ok("↓ 减到 2.75x", video.playbackRate === 2.75, { rate: video.playbackRate });
+
+    // 3. ↑ 加一档
+    press(38, "ArrowUp", "ArrowUp");
+    await sleep(80);
+    ok("↑ 回到 3.0x", video.playbackRate === 3, { rate: video.playbackRate });
+
+    // 4. 上限夹取
+    press(38, "ArrowUp", "ArrowUp"); press(38, "ArrowUp", "ArrowUp");
+    await sleep(80);
+    ok("上限夹取在 3.0x", video.playbackRate === 3, { rate: video.playbackRate, max: window.__BHS__.cfg.max });
+
+    // 5. 按住期间 ↑/↓ 不影响音量
+    ok("按住期间音量不变", Math.abs(video.volume - 1) < 0.001, { vol: video.volume });
+
+    // 6. 连按（系统连发）节流
+    const beforeRepeat = video.playbackRate;
+    for (let i = 0; i < 5; i++) {
+      const e = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "ArrowDown", code: "ArrowDown", view: window });
+      Object.defineProperty(e, "keyCode", { get: () => 40 });
+      Object.defineProperty(e, "which", { get: () => 40 });
+      Object.defineProperty(e, "repeat", { get: () => true });
+      document.body.dispatchEvent(e);
+      await sleep(50);
+    }
+    ok("连发被节流（500ms 内最多 5 档）", video.playbackRate >= beforeRepeat - 1.25 - 0.001, { before: beforeRepeat, after: video.playbackRate });
+    // 收尾：抬起到一个已知值
+    up(40, "ArrowDown", "ArrowDown");
+
+    // 7. 下限夹取
+    for (let i = 0; i < 14; i++) { press(40, "ArrowDown", "ArrowDown"); await sleep(25); }
+    ok("下限夹取在 0.5x", video.playbackRate === 0.5, { rate: video.playbackRate, min: window.__BHS__.cfg.min });
+
+    // 8. 松开回到 1x
+    up(39, "ArrowRight", "ArrowRight");
+    await sleep(250);
+    ok("松开 → 回到 1.0x", video.playbackRate === 1 && S.mode === false, { rate: video.playbackRate, mode: S.mode });
+
+    // 9. 记忆生效
+    ok("记录了本次倍速 0.5x", window.__BHS__.cfg.last === 0.5, { last: window.__BHS__.cfg.last });
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    ok("再次按住复用记忆值 0.5x", video.playbackRate === 0.5, { rate: video.playbackRate });
+    press(38, "ArrowUp", "ArrowUp");
+    await sleep(80);
+    up(39, "ArrowRight", "ArrowRight");
+    await sleep(250);
+
+    // 10. 短按 → 快进 5 秒且不应触发倍速
+    video.playbackRate = 1;
+    video.currentTime = 10;
+    await sleep(60);
+    const t0 = video.currentTime;
+    press(39, "ArrowRight", "ArrowRight");
+    await sleep(250);
+    ok("短按 → 快进约 5s 且不进倍速",
+      Math.abs(video.currentTime - t0 - 5) < 1.0 && !S.mode && video.playbackRate === 1,
+      { delta: +(video.currentTime - t0).toFixed(2), rate: video.playbackRate });
+
+    // 11. 短按 ← 快退 5 秒
+    const t1 = video.currentTime;
+    press(37, "ArrowLeft", "ArrowLeft");
+    await sleep(250);
+    ok("短按 ← 快退约 5s", Math.abs(video.currentTime - t1 + 5) < 1.0, { delta: +(video.currentTime - t1).toFixed(2) });
+
+    // 12. 长按 ← 也可触发（bothSides = true）
+    video.currentTime = 30;
+    down(37, "ArrowLeft", "ArrowLeft");
+    await sleep(400);
+    ok("长按 ← 进入倍速", S.mode === true && video.playbackRate === window.__BHS__.cfg.last, { mode: S.mode, rate: video.playbackRate });
+    up(37, "ArrowLeft", "ArrowLeft");
+    await sleep(250);
+    ok("松开 ← 回到 1x", video.playbackRate === 1, { rate: video.playbackRate });
+
+    // 13. 不按触发键时 ↑/↓ 交给原生（改音量）
+    video.volume = 0.5;
+    await sleep(50);
+    press(38, "ArrowUp", "ArrowUp");
+    await sleep(100);
+    ok("单独按 ↑ 仍由原生调音量", Math.abs(video.volume - 0.6) < 0.001 && S.mode === false, { vol: video.volume });
+
+    // 14. 输入框内不接管
+    const box = document.createElement("input");
+    box.style.cssText = "position:absolute;left:-9999px;";
+    document.body.appendChild(box);
+    box.focus();
+    const evInput = fire("keydown", 39, "ArrowRight", "ArrowRight");
+    fire("keyup", 39, "ArrowRight", "ArrowRight");
+    await sleep(120);
+    ok("输入框内不拦截 →", evInput.defaultPrevented === false && S.mode === false && S.held.size === 0, { prevented: evInput.defaultPrevented });
+    box.remove();
+    document.body.focus();
+
+    // 15. 失焦复位
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    window.dispatchEvent(new Event("blur"));
+    await sleep(150);
+    ok("窗口失焦复位到 1x", video.playbackRate === 1 && S.mode === false && S.held.size === 0,
+      { rate: video.playbackRate, mode: S.mode, held: S.held.size });
+
+    // 16. 外部写入被接管（按住期间任何改倍速都会回到目标值）
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    video.playbackRate = 2;
+    video.defaultPlaybackRate = 2;
+    await sleep(100);
+    ok("按住期间外部改写被纠正", video.playbackRate === window.__BHS__.state.target, { rate: video.playbackRate, target: window.__BHS__.state.target });
+    up(39, "ArrowRight", "ArrowRight");
+    await sleep(250);
+
+    render();
+  }
+
+  function render() {
+    const lines = results.map(function (r) {
+      const tag = r.pass ? '<span class="pass">PASS</span>' : '<span class="fail">FAIL</span>';
+      return tag + "  " + r.name + (r.detail ? "   " + JSON.stringify(r.detail) : "");
+    });
+    const passed = results.filter(function (r) { return r.pass; }).length;
+    const head = "结果：" + passed + " / " + results.length + (passed === results.length ? "  全部通过" : "  有失败项");
+    const nativeLog = "\n\n— 原生播放器模拟日志（本页复刻的 B 站行为）—\n" + window.__NATIVE_LOG__.slice(-12).join("\n");
+    out.innerHTML = head + "\n\n" + lines.join("\n") + nativeLog +
+      "\n\n（在上方直接手动按键体验时，控制台可用 window.__BHS__ 查看脚本状态）";
+  }
+
+  document.getElementById("run").addEventListener("click", run);
+  document.getElementById("clear").addEventListener("click", function () {
+    out.textContent = "已清空。";
+    window.__NATIVE_LOG__.length = 0;
+  });
+})();
+</script>
+</body>
+</html>
