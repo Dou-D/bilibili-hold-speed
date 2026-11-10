@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站 按住方向键倍速微调
 // @namespace    bilibili-hold-speed
-// @version      2.0.1
-// @description  按住 ← / → 以倍速播放，按住期间用 ↑/↓ 以 0.25x 为步长微调（默认 0.5x ~ 3x）；松开按键立即回到 1 倍速。短按 ← / → 保持 B 站原生的 ±5 秒快进。
+// @version      2.0.2
+// @description  按住 ← / → 以倍速播放，按住期间用 ↑/↓ 以 0.25x 为步长微调（默认 0.5x ~ 3x）；松开按键恢复本轮加速前的倍速。短按 ← / → 保持 B 站原生的 ±5 秒快进。
 // @author       local
 // @match        https://www.bilibili.com/*
 // @match        https://bilibili.com/*
@@ -72,7 +72,6 @@
     max: 3,
     min: 0.5,
     startRate: 3, // 进入倍速时的起始倍速（有记忆值时以记忆值为准）
-    restoreTo: "one", // "one": 松开回到 1x；"base": 松开回到长按前的倍速
     remember: true,
     overlay: true,
     last: null, // 记住的倍速（仅作用于「按住期间」的起始值）
@@ -363,6 +362,7 @@
     if (!el) return;
     state.video = el;
     patchVideo(el);
+    state.base = readRate(el); // 每轮仅在临时改速前记录一次，避免按键连发覆盖原倍速
     state.mode = true;
     state.adjusted = false;
     state.target = clampRate(cfg.remember && typeof cfg.last === "number" ? cfg.last : cfg.startRate);
@@ -390,8 +390,8 @@
       cfg.last = target;
       saveConfig();
     }
-    // 松开即恢复：默认回到 1 倍速
-    const restore = cfg.restoreTo === "base" ? state.base : 1;
+    // 恢复本轮临时加速前的实际倍速，不受临时倍速上下限影响
+    const restore = state.base;
     if (el && el.isConnected) writeRate(el, restore);
     if (cfg.overlay) {
       showOverlay(restore, "已松开 · 恢复正常倍速");
@@ -498,7 +498,6 @@
       state.held.add(name);
       state.video = el;
       if (!state.mode && !state.holdTimer) {
-        state.base = readRate(el);
         state.holdTimer = window.setTimeout(enterMode, HOLD_DELAY);
       }
       return;
@@ -631,11 +630,6 @@
     add("倍速下限：" + cfg.min + "x", function () {
       cfg.min = cycle(MIN_OPTIONS, cfg.min);
       if (cfg.min >= cfg.max) cfg.max = cfg.min + cfg.step;
-      saveConfig();
-      refreshMenu();
-    });
-    add("松开后恢复：" + (cfg.restoreTo === "one" ? "1 倍速" : "长按前的倍速"), function () {
-      cfg.restoreTo = cfg.restoreTo === "one" ? "base" : "one";
       saveConfig();
       refreshMenu();
     });

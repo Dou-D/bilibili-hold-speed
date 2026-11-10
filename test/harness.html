@@ -56,7 +56,7 @@
 
   <ol>
     <li>先点一下视频区域，让页面获得键盘焦点。</li>
-    <li>手动体验：<b>按住 →</b> 进入 3 倍速，不松手时按 <b>↑ / ↓</b> 以 0.25 步长调节，<b>松开 →</b> 回到 1 倍速。</li>
+    <li>手动体验：<b>按住 →</b> 进入 3 倍速，不松手时按 <b>↑ / ↓</b> 以 0.25 步长调节，<b>松开 →</b> 恢复本次加速前的倍速。</li>
     <li>也可以直接点「运行全部测试」自动跑一遍（包含合成按键与断言）。</li>
   </ol>
 
@@ -157,6 +157,18 @@
 // 2) 加载被测脚本（真实源码），并在没有 GM_* API 时走 localStorage 降级
 // ---------------------------------------------------------------------------
 window.__BHS_TEST_SRC__ = null;
+
+// 仅模拟菜单注册，存储仍走 localStorage，便于验证从菜单禁用时的恢复行为。
+window.__BHS_TEST_MENUS__ = new Map();
+let menuId = 0;
+window.GM_registerMenuCommand = function (label, fn) {
+  const id = ++menuId;
+  window.__BHS_TEST_MENUS__.set(id, { label: label, fn: fn });
+  return id;
+};
+window.GM_unregisterMenuCommand = function (id) {
+  window.__BHS_TEST_MENUS__.delete(id);
+};
 </script>
 
 <script id="loader">
@@ -232,7 +244,6 @@ function startHud() {
     window.__BHS__.cfg.max = 3;
     window.__BHS__.cfg.min = 0.5;
     window.__BHS__.cfg.startRate = 3;
-    window.__BHS__.cfg.restoreTo = "one";
     window.__BHS__.cfg.bothSides = true;
     video.volume = 1;
     window.__BHS__.state.held.clear();
@@ -241,6 +252,15 @@ function startHud() {
     video.defaultPlaybackRate = 1;
 
     const S = window.__BHS__.state;
+    function setBaseRate(rate) {
+      video.playbackRate = rate;
+      video.defaultPlaybackRate = rate;
+    }
+    function checkRestored(name, rate) {
+      ok(name, video.playbackRate === rate && video.defaultPlaybackRate === rate &&
+        !S.mode && S.held.size === 0 && !S.holdTimer && !S.watchTimer,
+        { rate: video.playbackRate, defaultRate: video.defaultPlaybackRate, mode: S.mode, held: S.held.size });
+    }
 
     // 1. 按住 → 进入起始倍速
     down(39, "ArrowRight", "ArrowRight");
@@ -283,10 +303,10 @@ function startHud() {
     for (let i = 0; i < 14; i++) { press(40, "ArrowDown", "ArrowDown"); await sleep(25); }
     ok("下限夹取在 0.5x", video.playbackRate === 0.5, { rate: video.playbackRate, min: window.__BHS__.cfg.min });
 
-    // 8. 松开回到 1x
+    // 8. 原倍速为 1x 时，松开仍恢复 1x
     up(39, "ArrowRight", "ArrowRight");
     await sleep(250);
-    ok("松开 → 回到 1.0x", video.playbackRate === 1 && S.mode === false, { rate: video.playbackRate, mode: S.mode });
+    checkRestored("原倍速为 1x，松开 → 恢复 1x", 1);
 
     // 9. 记忆生效
     ok("记录了本次倍速 0.5x", window.__BHS__.cfg.last === 0.5, { last: window.__BHS__.cfg.last });
@@ -343,13 +363,13 @@ function startHud() {
     box.remove();
     document.body.focus();
 
-    // 15. 失焦复位
+    // 15. 非 1 倍速时失焦，也应恢复原倍速
+    setBaseRate(1.5);
     down(39, "ArrowRight", "ArrowRight");
     await sleep(400);
     window.dispatchEvent(new Event("blur"));
     await sleep(150);
-    ok("窗口失焦复位到 1x", video.playbackRate === 1 && S.mode === false && S.held.size === 0,
-      { rate: video.playbackRate, mode: S.mode, held: S.held.size });
+    checkRestored("窗口失焦恢复到原来的 1.5x", 1.5);
 
     // 16. 外部写入被接管（按住期间任何改倍速都会回到目标值）
     down(39, "ArrowRight", "ArrowRight");
@@ -360,6 +380,83 @@ function startHud() {
     ok("按住期间外部改写被纠正", video.playbackRate === window.__BHS__.state.target, { rate: video.playbackRate, target: window.__BHS__.state.target });
     up(39, "ArrowRight", "ArrowRight");
     await sleep(250);
+
+    // 17. 每轮重新捕获原倍速；连发、双触发键和临时微调不能覆盖它
+    window.__BHS__.cfg.remember = false;
+    for (const base of [1.5, 2]) {
+      setBaseRate(base);
+      down(39, "ArrowRight", "ArrowRight");
+      await sleep(400);
+      ok("原倍速 " + base + "x 时进入临时 3x", S.mode && video.playbackRate === 3, { rate: video.playbackRate });
+      fire("keydown", 39, "ArrowRight", "ArrowRight", { repeat: true });
+      fire("keydown", 39, "ArrowRight", "ArrowRight", { repeat: true });
+      down(37, "ArrowLeft", "ArrowLeft");
+      press(40, "ArrowDown", "ArrowDown");
+      up(39, "ArrowRight", "ArrowRight");
+      ok("只松开一个触发键仍保持微调后的倍速", S.mode && video.playbackRate === 2.75, { rate: video.playbackRate });
+      up(37, "ArrowLeft", "ArrowLeft");
+      checkRestored("连发和微调后恢复本轮原倍速 " + base + "x", base);
+    }
+
+    // 18. 300ms 等待期间原倍速变化，应保存实际进入时的值
+    setBaseRate(1.5);
+    down(39, "ArrowRight", "ArrowRight");
+    setBaseRate(2);
+    await sleep(400);
+    up(39, "ArrowRight", "ArrowRight");
+    checkRestored("恢复等待期间更新后的 2x", 2);
+
+    // 19. ↑/↓ 提前进入倍速，也应记录原倍速
+    setBaseRate(1.5);
+    down(39, "ArrowRight", "ArrowRight");
+    press(40, "ArrowDown", "ArrowDown");
+    ok("↓ 可在长按计时结束前进入并微调", S.mode && video.playbackRate === 2.75, { rate: video.playbackRate });
+    up(39, "ArrowRight", "ArrowRight");
+    checkRestored("提前进入后恢复 1.5x", 1.5);
+
+    // 20. 短按只快进，不改变原倍速
+    setBaseRate(2);
+    press(39, "ArrowRight", "ArrowRight");
+    checkRestored("短按保持原来的 2x", 2);
+
+    // 21. 原倍速不应被临时加速的上下限夹取
+    for (const base of [0.25, 4]) {
+      setBaseRate(base);
+      down(39, "ArrowRight", "ArrowRight");
+      await sleep(400);
+      up(39, "ArrowRight", "ArrowRight");
+      checkRestored("原倍速 " + base + "x 超出临时范围时仍原样恢复", base);
+    }
+
+    // 22. 页面隐藏与失焦采用相同的恢复路径
+    setBaseRate(2);
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    delete document.hidden;
+    checkRestored("页面隐藏恢复原来的 2x", 2);
+
+    // 23. 从脚本菜单禁用时也恢复原倍速
+    const toggleEnabled = Array.from(window.__BHS_TEST_MENUS__.values())
+      .find(function (menu) { return menu.label.indexOf("长按倍速微调：") === 0; }).fn;
+    setBaseRate(1.5);
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    toggleEnabled();
+    checkRestored("禁用脚本恢复原来的 1.5x", 1.5);
+    ok("菜单已禁用脚本", window.__BHS__.cfg.enabled === false);
+    toggleEnabled();
+
+    // 24. 兼容旧存储中遗留的恢复配置
+    window.__BHS__.cfg.restoreTo = "one";
+    setBaseRate(2);
+    down(39, "ArrowRight", "ArrowRight");
+    await sleep(400);
+    up(39, "ArrowRight", "ArrowRight");
+    checkRestored("旧 restoreTo=one 不再强制恢复 1x", 2);
+    delete window.__BHS__.cfg.restoreTo;
+    window.__BHS__.cfg.remember = true;
 
     render();
   }
